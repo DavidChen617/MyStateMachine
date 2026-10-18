@@ -16,7 +16,7 @@
 
 開始吧，先看一段再普通不過的 async 程式。
 
-## 原始碼
+## 一段普通的 async 程式
 
 ```csharp
 var s = await GetStringAsync();
@@ -29,12 +29,9 @@ static Task<string> GetStringAsync() => Task.FromResult("Hello World!");
 static Task<int> GetIntAsync() => Task.FromResult(1);
 ```
 
-## 改寫後的結構
+把編譯出來的 dll 丟進反編譯工具，就能看到編譯器產生的程式碼。以下是 Debug 組態的結果。
 
-`async` / `await` 是語法糖。編譯器會把 async 方法拆成兩部分：
-
-- stub 方法：建立並啟動狀態機。
-- 狀態機類別：實作 `IAsyncStateMachine`，原本的方法本體搬進它的 `MoveNext`。
+## 編譯器產生了什麼
 
 ```
 Program
@@ -42,12 +39,12 @@ Program
 ├── <Main>$(args)                   stub：建立狀態機、Start、回傳 Task
 ├── <<Main>$>g__GetStringAsync|0_0  local function 變成靜態方法
 ├── <<Main>$>g__GetIntAsync|0_1
-└── <<Main>$>d__0 : IAsyncStateMachine   狀態機，方法本體都在 MoveNext 裡
+└── <<Main>$>d__0 : IAsyncStateMachine   狀態機
 ```
 
-## 1. Stub 方法
+原本的方法本體全部搬進狀態機的 `MoveNext`。
 
-原本的方法只負責啟動狀態機：
+## Stub：只負責發動
 
 ```csharp
 [AsyncStateMachine(typeof(Program.<<Main>$>d__0))]
@@ -62,28 +59,22 @@ private static Task <Main>$(string[] args)
 }
 ```
 
-- 方法簽章沒變，仍回傳 `Task`，呼叫端不必知道內部實作。
-- `Start` 在呼叫端的執行緒上直接執行第一次 `MoveNext`，執行到第一個未完成的 await 才返回。
-- 呼叫端拿到的就是 `Builder.Task`。狀態機最後呼叫 `SetResult` 或 `SetException`，這個 Task 才完成。
+`Start` 在呼叫端的執行緒上同步執行第一次 `MoveNext`，直到碰上第一個未完成的 await 才返回。
 
-Top-level statements 的進入點 `<Main>` 把 `<Main>$` 回傳的 Task 交給 `AsyncHelpers.HandleAsyncEntryPoint`，這是這次反編譯看到的寫法。我印象中較舊的編譯器會產生 `<Main>$(args).GetAwaiter().GetResult()`，但沒查到哪個版本改的。
-
-## 2. 狀態機的欄位
+## 狀態機的欄位：區域變數搬家
 
 | 欄位 | 用途 |
 |---|---|
 | `<>1__state` | 目前狀態：`-1` 執行中，`0` 停在第 1 個 await，`1` 停在第 2 個 await，`-2` 已結束 |
 | `<>t__builder` | `AsyncTaskMethodBuilder`，負責建立 Task、註冊 continuation、設定結果 |
 | `args` | 方法參數 |
-| `<s>5__1`、`<i>5__2` | 原始碼的區域變數 `s`、`i`，提升（hoist）成欄位 |
+| `<s>5__1`、`<i>5__2` | 原始碼的區域變數 `s`、`i` |
 | `<>s__3`、`<>s__4` | 編譯器加的暫存變數，接住 `GetResult()` 的回傳值 |
 | `<>u__1`、`<>u__2` | 每個 await 各有一個 awaiter，掛起時存入，恢復時取出 |
 
-每次呼叫 `MoveNext` 都是全新的方法呼叫，區域變數不會保留，要跨過 await 的值只能放在欄位。
+每次恢復都是重新呼叫 `MoveNext`，區域變數不會保留，所以要跨過 await 的值都存成欄位。
 
-Release 組態只提升真正跨過 await 的變數。這份反編譯的狀態機是 `class`，`s`、`i` 也都提升了，我因此判斷它是 Debug 組態的結果。
-
-## 3. MoveNext
+## MoveNext：一個 await 拆成五步
 
 每個 `await X` 都展開成同一個樣板：
 
@@ -100,7 +91,7 @@ ResumeN:
 result = awaiter.GetResult();          // 5. 取結果；失敗時例外從這裡拋出
 ```
 
-恢復時，`MoveNext` 先看 `<>1__state`，決定跳到哪裡：
+恢復時，`MoveNext` 開頭依 `<>1__state` 跳回原位：
 
 ```csharp
 int num1 = <>1__state;
@@ -121,11 +112,9 @@ else
 }
 ```
 
-`await` 後面的程式碼要等下一次呼叫 `MoveNext` 才執行。方法有 N 個 await，最多切成 N+1 段，分散在不同次的 `MoveNext` 呼叫裡。
+方法有 N 個 await，最多切成 N+1 段，分散在不同次的 `MoveNext` 呼叫裡。
 
-反編譯結果裡的 `num2` 沒有用途。IL 裡是 `state = num2 = 0` 這種連鎖賦值，反編譯器還原時留下了它。
-
-## 4. 結束
+## 收尾：結果和例外都交給 builder
 
 ```csharp
 catch (Exception ex)
@@ -140,42 +129,162 @@ catch (Exception ex)
 <>t__builder.SetResult();          // Task 變成 RanToCompletion
 ```
 
-方法丟出的例外不會直接往外拋，而是存進 Task，等呼叫端 `await` 這個 Task 時再拋一次。
+例外不會直接往外拋，而是存進 Task，等呼叫端 `await` 時再拋出。
 
-`<i>5__2` 是 `int`，沒有參考要釋放，所以不必清。
+## 等等，這個例子根本沒停過
 
-## 5. 這個例子沒有掛起過
+`Task.FromResult` 回傳已完成的 Task，兩個 `if (!awaiter.IsCompleted)` 都不會進去，整個方法在第一次 `MoveNext` 就跑完了。這叫 fast path。要看到掛起，得給 await 一個未完成的 Task。
 
-`Task.FromResult` 回傳已完成的 Task，`IsCompleted` 一開始就是 `true`，兩個 `if (!awaiter.IsCompleted)` 都不會進去。
+## 讓它真的停下來
 
-整個方法在第一次 `MoveNext` 就跑完：沒有掛起、沒換執行緒，也沒建立 continuation。這條路徑叫 fast path。
+`Program.cs` 不用 `async` / `await`，手寫狀態機 `MyStateMachine`，等同於：
 
-遇到未完成的 Task，才會呼叫 `AwaitUnsafeOnCompleted`。builder 這時把狀態機包進 heap 上的 box，再註冊成 Task 的 continuation。
+```csharp
+async Task RunAsync()
+{
+    Log($"Got {await FakeNetwork.SendAsync("Get /a")}");
+    Log($"Got {await FakeNetwork.SendAsync("Get /b")}");
+}
+```
 
-## 6. Debug 和 Release
+### MyStateMachine
 
-| | Debug | Release |
-|---|---|---|
-| 狀態機型別 | `class` | `struct` |
-| 第一次掛起時 | 本來就在 heap 上 | builder 把 struct 複製進 box |
-| 提升的區域變數 | 全部 | 只有跨 await 的 |
+```csharp
+class MyStateMachine : IAsyncStateMachine
+{
+    public int State { get; set; }
 
-Release 用 struct，讓走 fast path 的呼叫完全不配置記憶體。
+    public AsyncTaskMethodBuilder Builder;
 
-## 動手試
+    private TaskAwaiter<string> savedAwaiter1;
 
-`Program.cs` 不用 `async` / `await`，照上面的樣板手寫 `MyStateMachine`，再用 `FakeNetwork` 模擬網路 I/O：封包「到達」時，IO 執行緒呼叫 `TaskCompletionSource.SetResult`。執行後能看到狀態機實際掛起、恢復，也看得到每段 `MoveNext` 在哪條執行緒上執行。
+    private TaskAwaiter<string> savedAwaiter2;
+
+    public void MoveNext()
+    {
+        Log($" MoveNext entered, State = {State}");
+        int num1 = State;
+        try
+        {
+            TaskAwaiter<string> awaiter1;
+            TaskAwaiter<string> awaiter2;
+
+            if (num1 != 0)
+            {
+                if (num1 != 1)
+                {
+                    Log("Sending request A");
+                    awaiter1 = FakeNetwork.SendAsync("Get /a").GetAwaiter();
+                    if (!awaiter1.IsCompleted)
+                    {
+                        State = 0;
+                        savedAwaiter1 = awaiter1;
+                        MyStateMachine stateMachine = this;
+                        Log($"Suspended State = {State}, MoveNext() returns, thread released");
+                        Builder.AwaitUnsafeOnCompleted(ref awaiter1, ref stateMachine);
+
+                        return;
+                    }
+                }
+                else
+                {
+                    awaiter2 = savedAwaiter2;
+                    savedAwaiter2 = new TaskAwaiter<string>();
+                    State = -1;
+                    goto label9;
+                }
+            }
+            else
+            {
+                awaiter1 = savedAwaiter1;
+                savedAwaiter1 = new TaskAwaiter<string>();
+                State = -1;
+            }
+
+            Log($"Got {awaiter1.GetResult()}");
+            Log("Sending request B");
+            awaiter2 = FakeNetwork.SendAsync("Get /b").GetAwaiter();
+            if (!awaiter2.IsCompleted)
+            {
+                State = 1;
+                savedAwaiter2 = awaiter2;
+                MyStateMachine stateMachine = this;
+                Log($"Suspended State = {State}");
+                Builder.AwaitUnsafeOnCompleted(ref awaiter2, ref stateMachine);
+                return;
+            }
+
+        label9:
+            Log($"Got {awaiter2.GetResult()}");
+        }
+        catch (Exception e)
+        {
+            State = -2;
+            Builder.SetException(e);
+
+            return;
+        }
+
+        State = -2;
+        Builder.SetResult();
+    }
+
+    public void SetStateMachine(IAsyncStateMachine stateMachine)
+    {
+    }
+    public static void Log(string msg) => Console.WriteLine($"{DateTimeOffset.Now:HH:mm:ss.fff} [T{Environment.CurrentManagedThreadId}] {msg}");
+}
+```
+
+Main 負責建立狀態機並啟動：
+
+```csharp
+MyStateMachine stateMachine = new()
+{
+    Builder = AsyncTaskMethodBuilder.Create(),
+    State = -1,
+};
+stateMachine.Builder.Start(ref stateMachine);
+Task work = stateMachine.Builder.Task;
+```
+
+### 和編譯器版本的差異
+
+- 沒有 stub 方法，Main 直接建立並啟動狀態機，所以 `State` 和 `Builder` 必須是公開的。
+- 沒有提升的區域變數。`GetResult()` 的結果直接印出，所以沒有 `<s>5__1` 這類欄位。
+- 多了 `Log` 呼叫，方便觀察執行順序。
+- Main 用 `while` 輪詢 `IsCompleted`，沒有用 `await`，目的是在輸出裡看到 T1 在做別的事。
+
+### 執行
 
 ```bash
 dotnet run
 ```
 
-| 反編譯結果 | `Program.cs` |
-|---|---|
-| `<>1__state` | `State` |
-| `<>t__builder` | `Builder` |
-| `<>u__1`、`<>u__2` | `savedAwaiter1`、`savedAwaiter2` |
-| `GetStringAsync()` / `GetIntAsync()` | `FakeNetwork.SendAsync(...)`，回傳未完成的 Task |
+輸出（節錄）：
+
+```
+[T1]  MoveNext entered, State = -1
+[T1] Sending request A
+[T1]  [NIC] Sent Get /a, response expected in 676ms
+[T1] Suspended State = 0, MoveNext() returns, thread released
+[T1] Main: Start() returned, free to do other work
+[T1] Main: doing other work...
+[T1] Main: doing other work...
+[T4]  [IO] Get /a packet arrived -> SetResult
+[T4]  [IO] SetException/SetResult returned
+[T5]  MoveNext entered, State = 0
+[T5] Got Get /a response
+[T5] Sending request B
+[T5] Suspended State = 1
+[T1] Main: doing other work...
+[T4]  [IO] Get /b packet arrived -> SetResult
+[T5]  MoveNext entered, State = 1
+[T5] Got Get /b response
+[T1] Main: done
+```
+
+T1 掛起後回去做別的事，等待期間沒有執行緒卡在請求上；T4（IO）呼叫 `SetResult` 後，由 thread pool 的 T5 接著執行 `MoveNext`。
 
 ## 參考資料
 
@@ -185,4 +294,5 @@ dotnet run
 - [AsyncStateMachineAttribute](https://learn.microsoft.com/dotnet/api/system.runtime.compilerservices.asyncstatemachineattribute)：官方文件
 - [AsyncTaskMethodBuilder](https://learn.microsoft.com/dotnet/api/system.runtime.compilerservices.asynctaskmethodbuilder)：官方文件
 - [AsyncTaskMethodBuilderT.cs](https://github.com/dotnet/runtime/blob/main/src/libraries/System.Private.CoreLib/src/System/Runtime/CompilerServices/AsyncTaskMethodBuilderT.cs)：dotnet/runtime 原始碼，box 在這裡建立
+- [TaskCreationOptions.RunContinuationsAsynchronously](https://learn.microsoft.com/dotnet/api/system.threading.tasks.taskcreationoptions)：官方文件
 - [SharpLab](https://sharplab.io/)：非官方，貼上 C# 程式碼就能看編譯器改寫後的結果
